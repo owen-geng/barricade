@@ -175,6 +175,8 @@ class Environment:
             return -1
 
         self.player_turn = 0 if self.player_turn == 1 else 1
+
+        turn_count += 1 #Increment turn count
         return 0
         
 

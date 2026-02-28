@@ -152,5 +152,5 @@ def test_button(str = "Testing!"):
 root = tk.Tk()
 root.title("Barricade game")
 
-gui = BarricadeGUI(root, n=5)
+gui = BarricadeGUI(root, n=9)
 root.mainloop()

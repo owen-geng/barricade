@@ -29,6 +29,8 @@ class BarricadeGUI:
         tk.Button(frame, text = "Move", command=lambda: self.set_action("Move")).pack(side="left")
         tk.Button(frame, text = "hbar", command=lambda: self.set_action("hbar")).pack(side="left")
         tk.Button(frame, text = "vbar", command=lambda: self.set_action("vbar")).pack(side="left")
+        tk.Button(frame, text = "get representation", command=self.gui_representation_access).pack(side="left")
+        tk.Button(frame, text = "get representation", command=self.gui_action_mask_access).pack(side="left")
         self.label = tk.Label(frame, text="Turn: Red" if self.env.player_turn else "Turn: Blue")
         self.label_bluebarricade = tk.Label(frame, text=f"Blue Barricades Remaining: {self.env.barricade_counts[0]}")
         self.label_redbarricade = tk.Label(frame, text=f"Red Barricades Remaining: {self.env.barricade_counts[1]}")
@@ -38,6 +40,16 @@ class BarricadeGUI:
 
 
         self.draw_board()
+    
+    def gui_representation_access(self):
+        print(self.env.return_state_representation())
+
+    def gui_action_mask_access(self):
+        print(self.env.return_action_mask())
+
+    def debug_func(self):
+        #Debugging function
+        pass
 
 
     def set_action(self, action):
@@ -152,5 +164,5 @@ def test_button(str = "Testing!"):
 root = tk.Tk()
 root.title("Barricade game")
 
-gui = BarricadeGUI(root, n=9)
+gui = BarricadeGUI(root, n=7)
 root.mainloop()

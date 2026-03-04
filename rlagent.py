@@ -1,7 +1,6 @@
 #PLAN:
 #Representation - game is an MDP since the board state can be represented entirely irrespective of past:
 #7 layers on input: horizontal barricades, vertical barricades, colour planes representing barricade count, 2 player positions and who's turn it is (0 or 1).
-#Want to abstract from the game itself to generalise.
 
 import torch
 import torch.nn as nn

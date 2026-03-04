@@ -1,6 +1,7 @@
 #Environment for barricade.gg game
 import numpy as np
 from collections import deque
+import torch
 
 class Environment:
     def __init__(self, n = 7, barricade_count = 10, startpos = None):
@@ -15,8 +16,8 @@ class Environment:
         self.p2loc = [n-1, startpos]
 
         self.barricade_counts = [barricade_count, barricade_count]
-        self.horizontal_barricades = np.zeros([n,n])
-        self.vertical_barricades = np.zeros([n,n])
+        self.horizontal_barricades = np.zeros([n,n], dtype=int)
+        self.vertical_barricades = np.zeros([n,n], dtype=int)
         self.turn_count = 0
         self.player_turn = 0
         self.barricade_id = 1
@@ -115,12 +116,61 @@ class Environment:
 
 
     
-    def return_valid_actions(self, player):
+    def return_valid_actions(self, player = None):  #I think this is giga slow but it is what it is
         #Valid moves representation. First n by n represent all visitable squares. Next n-1 by n-1 represent h_barriers, and next n-1 by n-1 represent v_barriers.
         #By convention, placing a hbarrier in [0, 0] places one in [0,1] as well, and placing a vbarrier in [0,0] places one in [1,0] as well.
+        if player == None:
+            player = self.player_turn
         moves = self.return_valid_moves(player)
         horizontal_list = np.zeros((self.n, self.n))
         vertical_list = np.zeros((self.n, self.n))
+
+        if self.barricade_counts[player] <= 0:
+            return moves, horizontal_list, vertical_list
+        
+        for row in range(self.n-1):
+            for col in range(self.n-1):
+                #Check horizontal
+                if self.horizontal_barricades[row][col] == 0 and self.horizontal_barricades[row][col+1] == 0 and ((self.vertical_barricades[row][col] != self.vertical_barricades[row+1][col]) or self.vertical_barricades[row][col] == 0):
+                    #If no overlap and no cross
+
+                    #Check if paths are still possible
+                    self.horizontal_barricades[row][col] = self.barricade_id
+                    self.horizontal_barricades[row][col+1] = self.barricade_id
+                    if self.possible_path(0) and self.possible_path(1): #If both can still make it
+                        horizontal_list[row][col] = 1
+                    else:
+                        pass
+                    
+                    self.horizontal_barricades[row][col] = 0
+                    self.horizontal_barricades[row][col+1] = 0
+                else:
+                    pass
+                
+                #Check vertical
+                if self.vertical_barricades[row][col] == 0 and self.vertical_barricades[row+1][col] == 0 and ((self.horizontal_barricades[row][col] != self.horizontal_barricades[row][col+1]) or self.horizontal_barricades[row][col] == 0):
+
+                    self.vertical_barricades[row][col] = self.barricade_id
+                    self.vertical_barricades[row+1][col] = self.barricade_id
+                    if self.possible_path(0) and self.possible_path(1): #If both can still make it
+                        vertical_list[row][col] = 1
+                    else:
+                        pass
+                    self.vertical_barricades[row][col] = 0
+                    self.vertical_barricades[row+1][col] = 0
+                else:
+                    pass
+        
+        return moves, horizontal_list, vertical_list
+    
+    def return_valid_actions_RL(self, player = None):
+        #Valid moves representation. First n by n represent all visitable squares. Next n-1 by n-1 represent h_barriers, and next n-1 by n-1 represent v_barriers.
+        #By convention, placing a hbarrier in [0, 0] places one in [0,1] as well, and placing a vbarrier in [0,0] places one in [1,0] as well.
+        if player == None:
+            player = self.player_turn
+        moves = self.return_valid_moves(player)
+        horizontal_list = np.zeros((self.n-1, self.n-1))
+        vertical_list = np.zeros((self.n-1, self.n-1))
 
         if self.barricade_counts[player] <= 0:
             return moves, horizontal_list, vertical_list
@@ -218,6 +268,88 @@ class Environment:
         return None
     
 
+    #RL functions
+    def decode_agent_action(self, action_id): #Action ID, output of DQN
+        #N by N move locations, then n-1 by n-1 hbars and n-1 by n-1 vbars. 
+        #Returns an array [action, actionvalue]. Action 0 = move, 1 = hbar, 2 = vbar.
+        hbarvbarsize = (self.n-1)*(self.n-1)
+        movesize = self.n*self.n
+        if action_id < movesize: #Move
+            row = action_id//self.n
+            col = action_id%self.n
+            return [0, [row,col]]
+        
+        elif action_id < movesize*2: #hbar
+            action_id = action_id-movesize
+            row=action_id//(self.n-1)
+            col=action_id%(self.n-1)
+            return [1, [row,col]]
+        
+        elif action_id < movesize*3: #vbar
+            action_id = action_id-movesize-hbarvbarsize
+            row=action_id//(self.n-1)
+            col=action_id%(self.n-1)
+            return [2, [row,col]]
+
+        else:
+            print("Invalid actionID")
+            return None
+        
+
+    def agent_action_function(self, action_ID): #Function which agents will use to interact with the env.
+        action = self.decode_agent_action(action_ID)
+        if action[0] == 0: #Move
+            self.move(action[1])
+        elif action[0] == 1:
+            self.place_horizontal_barrier(action[1])
+        elif action[0] == 2:
+            self.place_vertical_barrier(action[1])
+        else:
+            print("Invalid action")
+            return None
+        return 1
+    
+    def return_state_representation(self): #Returns state representation.
+        #7 layers on input: horizontal barricades, vertical barricades, colour planes representing barricade count, 2 player positions and who's turn it is (0 or 1).
+        hbarricades = torch.from_numpy(self.horizontal_barricades)
+        vbarricades = torch.from_numpy(self.vertical_barricades)
+        p1count = torch.full((self.n,self.n), self.barricade_counts[0])
+        p2count = torch.full((self.n,self.n), self.barricade_counts[1])
+        p1location = torch.zeros((self.n,self.n), dtype=torch.int64)
+        p2location = torch.zeros((self.n,self.n), dtype=torch.int64)
+        p1location[self.p1loc[0]][self.p1loc[1]] = 1
+        p2location[self.p2loc[0]][self.p2loc[1]] = 1
+        turn = torch.full((self.n,self.n), self.player_turn, dtype=torch.int64)
+
+        tensor_stack = torch.stack((hbarricades,vbarricades,p1count,p2count,p1location,p2location,turn))
+
+        #Debug
+        """
+        print(f"Hbarricades: {hbarricades}")
+        print(f"Vbarricades: {vbarricades}")
+        print(f"p1count: {p1count}")
+        print(f"p2count: {p2count}")
+        print(f"p1location: {p1location}")
+        print(f"p2location: {p2location}")
+        print(f"turn: {turn}")
+        """
+        return tensor_stack
+    
+    def return_action_mask(self): #Returns mask for valid actions.
+        moves, hbar, vbar = self.return_valid_actions_RL()
+        moves = moves.flatten()
+        hbar = hbar.flatten()
+        vbar = vbar.flatten()
+        """
+        #Debug
+        print(f"Moves: {moves}")
+        print(f"hbar: {hbar}")
+        print(f"vbar: {vbar}")
+        """
+        numpy_arr = np.concatenate([moves, hbar, vbar])
+        numpy_arr = numpy_arr.astype(bool)
+        torch_mask = torch.from_numpy(numpy_arr)
+        return torch_mask
     
     
     def move_debug(self, player, loc): #Unsafe! For debugging

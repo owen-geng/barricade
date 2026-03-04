@@ -124,7 +124,7 @@ class BarricadeGUI:
         #Horizontal barricades
         for row in range(self.n-1):
             for col in range(self.n):
-                if self.env.horizontal_barricades[row][col] == 1:
+                if self.env.horizontal_barricades[row][col] != 0:
                     x0, y0 = col*self.cell_size, (row+1)*self.cell_size-2.5
                     x1, y1 = (col+1)*self.cell_size, (row+1)*self.cell_size+2.5
                     self.canvas.create_rectangle(x0, y0, x1, y1, fill="black", outline="")
@@ -132,7 +132,7 @@ class BarricadeGUI:
         #Vertical barricades
         for row in range(self.n):
             for col in range(self.n-1):
-                if self.env.vertical_barricades[row][col] == 1:
+                if self.env.vertical_barricades[row][col] != 0:
                     x0, y0 = (col+1)*self.cell_size-2.5, (row)*self.cell_size
                     x1, y1 = (col+1)*self.cell_size+2.5, (row+1)*self.cell_size
                     self.canvas.create_rectangle(x0, y0, x1, y1, fill="black", outline="")

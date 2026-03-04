@@ -19,6 +19,7 @@ class Environment:
         self.vertical_barricades = np.zeros([n,n])
         self.turn_count = 0
         self.player_turn = 0
+        self.barricade_id = 1
     
 
     def blocked_paths(self, loc): #Loc is a 2x2 arr
@@ -127,12 +128,12 @@ class Environment:
         for row in range(self.n-1):
             for col in range(self.n-1):
                 #Check horizontal
-                if self.horizontal_barricades[row][col] == 0 and self.horizontal_barricades[row][col+1] == 0 and (self.vertical_barricades[row][col] == 0 or self.vertical_barricades[row+1][col] == 0):
+                if self.horizontal_barricades[row][col] == 0 and self.horizontal_barricades[row][col+1] == 0 and ((self.vertical_barricades[row][col] != self.vertical_barricades[row+1][col]) or self.vertical_barricades[row][col] == 0):
                     #If no overlap and no cross
 
                     #Check if paths are still possible
-                    self.horizontal_barricades[row][col] = 1
-                    self.horizontal_barricades[row][col+1] = 1
+                    self.horizontal_barricades[row][col] = self.barricade_id
+                    self.horizontal_barricades[row][col+1] = self.barricade_id
                     if self.possible_path(0) and self.possible_path(1): #If both can still make it
                         horizontal_list[row][col] = 1
                     else:
@@ -144,10 +145,10 @@ class Environment:
                     pass
                 
                 #Check vertical
-                if self.vertical_barricades[row][col] == 0 and self.vertical_barricades[row+1][col] == 0 and (self.horizontal_barricades[row][col] == 0 or self.horizontal_barricades[row][col+1] == 0):
+                if self.vertical_barricades[row][col] == 0 and self.vertical_barricades[row+1][col] == 0 and ((self.horizontal_barricades[row][col] != self.horizontal_barricades[row][col+1]) or self.horizontal_barricades[row][col] == 0):
 
-                    self.vertical_barricades[row][col] = 1
-                    self.vertical_barricades[row+1][col] = 1
+                    self.vertical_barricades[row][col] = self.barricade_id
+                    self.vertical_barricades[row+1][col] = self.barricade_id
                     if self.possible_path(0) and self.possible_path(1): #If both can still make it
                         vertical_list[row][col] = 1
                     else:
@@ -176,7 +177,7 @@ class Environment:
 
         self.player_turn = 0 if self.player_turn == 1 else 1
 
-        turn_count += 1 #Increment turn count
+        self.turn_count += 1 #Increment turn count
         return 0
         
 
@@ -188,8 +189,9 @@ class Environment:
             print("Unsafe hbarrier!")
             return -1
 
-        self.horizontal_barricades[loc[0]][loc[1]] = 1
-        self.horizontal_barricades[loc[0]][loc[1]+1] = 1
+        self.horizontal_barricades[loc[0]][loc[1]] = self.barricade_id
+        self.horizontal_barricades[loc[0]][loc[1]+1] = self.barricade_id
+        self.barricade_id += 1
 
         self.barricade_counts[self.player_turn] -= 1
 
@@ -200,9 +202,9 @@ class Environment:
         if loc[0] > self.n-1 or loc[1] > self.n-1:
             print("Unsafe vbarrier!")
             return -1
-        self.vertical_barricades[loc[0]][loc[1]] = 1
-        self.vertical_barricades[loc[0]+1][loc[1]] = 1
-
+        self.vertical_barricades[loc[0]][loc[1]] = self.barricade_id
+        self.vertical_barricades[loc[0]+1][loc[1]] = self.barricade_id
+        self.barricade_id += 1
         self.barricade_counts[self.player_turn] -= 1
 
         self.player_turn = 0 if self.player_turn == 1 else 1
@@ -214,6 +216,9 @@ class Environment:
         if self.p2loc[0] == 0:
             return 1
         return None
+    
+
+    
     
     def move_debug(self, player, loc): #Unsafe! For debugging
 

@@ -48,8 +48,7 @@ class BarricadeGUI:
         print(self.env.return_action_mask())
 
     def debug_func(self):
-        #Debugging function
-        pass
+        self.env.decode_agent_action(35)
 
 
     def set_action(self, action):

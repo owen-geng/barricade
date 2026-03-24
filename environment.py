@@ -45,6 +45,36 @@ def _jit_possible_path(h_bars, v_bars, n, start_r, start_c, target_row):
 
 
 @_njit(cache=True)
+def _jit_path_length(h_bars, v_bars, n, start_r, start_c, target_row):
+    """BFS shortest-path distance to goal row. Returns n*n if unreachable."""
+    visited = np.zeros((n, n), dtype=np.bool_)
+    queue_r = np.empty(n * n, dtype=np.int32)
+    queue_c = np.empty(n * n, dtype=np.int32)
+    queue_d = np.empty(n * n, dtype=np.int32)
+    head = 0; tail = 0
+    queue_r[0] = start_r; queue_c[0] = start_c; queue_d[0] = 0; tail = 1
+    visited[start_r, start_c] = True
+
+    while head < tail:
+        r = queue_r[head]; c = queue_c[head]; d = queue_d[head]; head += 1
+        if r == target_row:
+            return d
+        if r > 0 and h_bars[r-1, c] == 0 and not visited[r-1, c]:
+            visited[r-1, c] = True
+            queue_r[tail] = r-1; queue_c[tail] = c; queue_d[tail] = d+1; tail += 1
+        if c < n-1 and v_bars[r, c] == 0 and not visited[r, c+1]:
+            visited[r, c+1] = True
+            queue_r[tail] = r; queue_c[tail] = c+1; queue_d[tail] = d+1; tail += 1
+        if r < n-1 and h_bars[r, c] == 0 and not visited[r+1, c]:
+            visited[r+1, c] = True
+            queue_r[tail] = r+1; queue_c[tail] = c; queue_d[tail] = d+1; tail += 1
+        if c > 0 and v_bars[r, c-1] == 0 and not visited[r, c-1]:
+            visited[r, c-1] = True
+            queue_r[tail] = r; queue_c[tail] = c-1; queue_d[tail] = d+1; tail += 1
+    return n * n
+
+
+@_njit(cache=True)
 def _jit_max_flow(h_bars, v_bars, n, start_r, start_c, target_row, cap):
     """BFS augmenting-path max-flow compiled to machine code by Numba.
     Replaces Python dict/deque with fixed-size numpy arrays.
@@ -319,12 +349,12 @@ class Environment:
         vertical_list = np.zeros((self.n-1, self.n-1))
 
         if self.barricade_counts[player] <= 0:
-            return moves, horizontal_list, vertical_list
+            return np.concatenate([moves, horizontal_list.flatten(), vertical_list.flatten()])
 
         flow0, nf0 = self._max_flow_to_goal(0)
         flow1, nf1 = self._max_flow_to_goal(1)
         if flow0 < 1 or flow1 < 1:
-            return moves, horizontal_list, vertical_list
+            return np.concatenate([moves, horizontal_list.flatten(), vertical_list.flatten()])
         all_safe = flow0 >= 3 and flow1 >= 3
 
         n = self.n
@@ -338,7 +368,7 @@ class Environment:
                ((h[:n-1, :n-1] != h[:n-1, 1:n]) | (h[:n-1, :n-1] == 0))
 
         if all_safe:
-            return moves, h_ok.astype(float), v_ok.astype(float)
+            return np.concatenate([moves, h_ok.astype(float).flatten(), v_ok.astype(float).flatten()])
 
         ddown, dright = self._dangerous_edge_arrays(nf0, nf1)
         hbar_edge_safe = ~(ddown[:n-1, :n-1] | ddown[:n-1, 1:n])
@@ -363,7 +393,7 @@ class Environment:
             self.vertical_barricades[row][col] = 0
             self.vertical_barricades[row+1][col] = 0
 
-        return moves, horizontal_list, vertical_list
+        return np.concatenate([moves, horizontal_list.flatten(), vertical_list.flatten()])
 
 
     def move(self, loc): #Unsafe
@@ -464,46 +494,32 @@ class Environment:
         return 1
     
     def return_state_representation(self): #Returns state representation.
-        #7 layers on input: horizontal barricades, vertical barricades, colour planes representing barricade count, 2 player positions and who's turn it is (0 or 1).
-        hbarricades = torch.from_numpy(self.horizontal_barricades)
-        vbarricades = torch.from_numpy(self.vertical_barricades)
-        p1count = torch.full((self.n,self.n), self.barricade_counts[0])
-        p2count = torch.full((self.n,self.n), self.barricade_counts[1])
-        p1location = torch.zeros((self.n,self.n), dtype=torch.int64)
-        p2location = torch.zeros((self.n,self.n), dtype=torch.int64)
-        p1location[self.p1loc[0]][self.p1loc[1]] = 1
-        p2location[self.p2loc[0]][self.p2loc[1]] = 1
-        turn = torch.full((self.n,self.n), self.player_turn, dtype=torch.int64)
+        # Canonical representation: always from current player's perspective.
+        # Layers: hbarricades, vbarricades, my_count, opp_count, my_location, opp_location, turn
+        # For player 1 the board is flipped vertically so both players always "move downward".
+        p = self.player_turn
+        hbarricades = torch.from_numpy((self.horizontal_barricades != 0).astype(np.float32))
+        vbarricades = torch.from_numpy((self.vertical_barricades != 0).astype(np.float32))
+        my_count  = torch.full((self.n, self.n), self.barricade_counts[p],   dtype=torch.float32)
+        opp_count = torch.full((self.n, self.n), self.barricade_counts[1-p], dtype=torch.float32)
+        my_loc  = torch.zeros((self.n, self.n), dtype=torch.float32)
+        opp_loc = torch.zeros((self.n, self.n), dtype=torch.float32)
+        my_pos  = self.p1loc if p == 0 else self.p2loc
+        opp_pos = self.p2loc if p == 0 else self.p1loc
+        my_loc[my_pos[0]][my_pos[1]]   = 1
+        opp_loc[opp_pos[0]][opp_pos[1]] = 1
+        turn = torch.full((self.n, self.n), p, dtype=torch.float32)
 
-        tensor_stack = torch.stack((hbarricades,vbarricades,p1count,p2count,p1location,p2location,turn))
+        tensor_stack = torch.stack((hbarricades, vbarricades, my_count, opp_count, my_loc, opp_loc, turn))
 
-        #Debug
-        """
-        print(f"Hbarricades: {hbarricades}")
-        print(f"Vbarricades: {vbarricades}")
-        print(f"p1count: {p1count}")
-        print(f"p2count: {p2count}")
-        print(f"p1location: {p1location}")
-        print(f"p2location: {p2location}")
-        print(f"turn: {turn}")
-        """
+        # Flip vertically for player 1 so current player always moves toward row n-1
+        if p == 1:
+            tensor_stack = torch.flip(tensor_stack, dims=[1])
+
         return tensor_stack
     
     def return_action_mask(self): #Returns mask for valid actions.
-        moves, hbar, vbar = self.return_valid_actions_RL()
-        moves = moves.flatten()
-        hbar = hbar.flatten()
-        vbar = vbar.flatten()
-        """
-        #Debug
-        print(f"Moves: {moves}")
-        print(f"hbar: {hbar}")
-        print(f"vbar: {vbar}")
-        """
-        numpy_arr = np.concatenate([moves, hbar, vbar])
-        numpy_arr = numpy_arr.astype(bool)
-        torch_mask = torch.from_numpy(numpy_arr)
-        return torch_mask
+        return torch.from_numpy(self.return_valid_actions_RL().astype(bool))
     
     
     def move_debug(self, player, loc): #Unsafe! For debugging

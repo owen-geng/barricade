@@ -1,0 +1,31 @@
+List of optimisations made to improve performance:
+
+Environment:
+Algorithmic (maxflow) optimisations to improve valid move find times. Cuts
+required calculations down dramatically as we are no longer (always) calling
+a BFS on every possible barricade.
+
+JIT compiled many heavy functions to improve runtime - cost of compilation is
+high, but it gets cached afterwards and runs at near C speed.
+
+
+DQN Agent:
+torch.compile(). small network though, so not much performance change.
+
+Train every 4 steps instead of every step, reduces number of backward passes.
+
+N-step returns. Speeds up training in early steps as Q-values are very noisy,
+so it increases the ratio between reward signal and noise.
+
+Instead of training 2 agents simultaneously, which lead to strategies converging
+to ones that simply beat each other (overfitting to two non-optimal strategies),
+changed to train against a fully random opponent for initial boostrapping, before
+switching to more complex self-play. Pooling to play against random past iterations
+of itself to prevent overfitting to a singular strategy.
+
+Cycle prevention. Early on in training, since initialised Q networks are highly
+random, it often gets trapped in infinite cycles. Later on, after the agents have
+learned some strategy, then backtracking may be viable, so the penalty is weaned off.
+
+Need to flip the board depending on who's turn it is. The agent loses track of the
+general direction it wants to travel in otherwise.

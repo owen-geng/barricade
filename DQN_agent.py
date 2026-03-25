@@ -54,22 +54,26 @@ class AgentNet(nn.Module):
 class ReplayBuffer():
     def __init__(self, capacity=100000):
         self.buffer = deque(maxlen=capacity)
-    
-    def push(self, state, action, reward, next_state, done): #Pushes a state onto the replay buffer
-        self.buffer.append((state, action, reward, next_state, done))
-    
-    def sample(self, batch_size): #Randomly samples from the replay buffer.
+
+    def push(self, state, action, reward, next_state, next_mask, done, n_actual):
+        self.buffer.append((state, action, reward, next_state, next_mask, done, n_actual))
+
+    def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
-        state, action, reward, next_state, done = zip(*batch)
+        state, action, reward, next_state, next_mask, done, n_actual = zip(*batch)
         return (torch.stack(state),
                 torch.tensor(action),
                 torch.tensor(reward, dtype=torch.float32),
                 torch.stack(next_state),
-                torch.tensor(done, dtype=torch.float32)) #Bool statement converted to float here, for Bellman equation updates.
+                torch.stack(next_mask),
+                torch.tensor(done, dtype=torch.float32),
+                torch.tensor(n_actual, dtype=torch.float32))
     
 
 class Agent:
-    def __init__(self, n):
+    def __init__(self, n, barrier_count):
+        self._n = n
+        self._barrier_count = barrier_count
         output_dim = 12 + 2*(n-1)*(n-1)
         self.policy_net = torch.compile(AgentNet(n, output_dim).to(device))
         self.target_net = torch.compile(AgentNet(n, output_dim).to(device))
@@ -87,8 +91,8 @@ class Agent:
         self.n_steps = 10
         self.n_step_buf = deque()
 
-    def push_transition(self, state, action, reward, next_state, done):
-        self.n_step_buf.append((state, action, reward, next_state, done))
+    def push_transition(self, state, action, reward, next_state, next_mask, done):
+        self.n_step_buf.append((state, action, reward, next_state, next_mask, done))
         if len(self.n_step_buf) == self.n_steps:
             self._commit_oldest()
         if done:
@@ -99,15 +103,19 @@ class Agent:
         """Compute n-step return from the oldest transition in the window and push to replay buffer."""
         G = 0.0
         final_ns = None
+        final_mask = None
         final_done = False
-        for i, (_, _, r, ns, d) in enumerate(self.n_step_buf):
+        k = 0
+        for i, (_, _, r, ns, nm, d) in enumerate(self.n_step_buf):
             G += (self.gamma ** i) * r
             final_ns = ns
+            final_mask = nm
+            k = i + 1
             if d:
                 final_done = True
                 break
         s0, a0 = self.n_step_buf[0][0], self.n_step_buf[0][1]
-        self.buffer.push(s0, a0, G, final_ns, final_done)
+        self.buffer.push(s0, a0, G, final_ns, final_mask, final_done, k)
         self.n_step_buf.popleft()
 
     def select_action(self, state, mask):
@@ -117,21 +125,28 @@ class Agent:
             return valid[random.randrange(len(valid))].item()
         with torch.no_grad():
             q = self.policy_net(state.unsqueeze(0).to(device))[0]
-            q[~mask] = -float('inf') #mask invalid actions
+            q[~mask.to(device)] = -float('inf') #mask invalid actions
             return q.argmax().item()
 
     def train_step(self, step):
         if len(self.buffer.buffer) < self.batch_size: #Buffer can't fill a full batch yet
             return
-        state, action, reward, next_state, done = self.buffer.sample(self.batch_size)
+        state, action, reward, next_state, next_mask, done, n_actual = self.buffer.sample(self.batch_size)
         state, next_state = state.to(device), next_state.to(device)
         action, reward, done = action.to(device), reward.to(device), done.to(device)
+        next_mask = next_mask.to(device)
+        n_actual = n_actual.to(device)
 
         q_vals = self.policy_net(state).gather(1, action.unsqueeze(1)).squeeze()
 
         with torch.no_grad():
-            next_q = self.target_net(next_state).max(1).values
-            targets = reward + (self.gamma ** self.n_steps) * next_q * (1-done) #n-step Bellman update
+            # Double DQN: policy_net selects action, target_net evaluates it.
+            # Mask invalid actions before argmax to avoid bootstrapping from illegal moves.
+            next_q_policy = self.policy_net(next_state)
+            next_q_policy[~next_mask] = -float('inf')
+            next_actions = next_q_policy.argmax(1, keepdim=True)
+            next_q = self.target_net(next_state).gather(1, next_actions).squeeze(1)
+            targets = reward + (self.gamma ** n_actual) * next_q * (1-done) #n-step Bellman update
         
         loss = nn.functional.smooth_l1_loss(q_vals, targets)
         self.optimiser.zero_grad()
@@ -142,19 +157,20 @@ class Agent:
         self.eps = max(self.eps_min, self.eps*self.eps_decay)
         if step % self.target_update_freq == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
-            torch.save(self.policy_net.state_dict(), 'dqn.pt')
+            torch.save({'state_dict': {k.replace('_orig_mod.', ''): v for k, v in self.policy_net.state_dict().items()},
+                        'n': self._n, 'barrier_count': self._barrier_count}, 'dqn.pt')
 
 
 
 #Training loop
 
-def _eval_vs_random(agent, n, games=100):
+def _eval_vs_random(agent, n, barrier_count, games=100):
     """Play `games` matches: agent as p0 for half, p1 for half. Returns win rate."""
-    env = Environment(n)
+    env = Environment(n, barrier_count)
     score = 0.0
     for game in range(games):
         agent_side = game % 2  # alternate sides
-        env.__init__(n)
+        env.__init__(n, barrier_count)
         done = False
         turn = 0
         while not done and turn < MAX_TURNS:
@@ -163,7 +179,7 @@ def _eval_vs_random(agent, n, games=100):
             if p == agent_side:
                 with torch.no_grad():
                     q = agent.policy_net(env.return_state_representation().unsqueeze(0).to(device))[0]
-                    q[~mask] = -float('inf')
+                    q[~mask.to(device)] = -float('inf')
                     action = q.argmax().item()
             else:
                 valid = mask.nonzero().flatten()
@@ -178,6 +194,8 @@ def _eval_vs_random(agent, n, games=100):
         if not done:  # timeout = draw
             score += 0.5
     return score / games
+
+
 
 def _path_length(env, player):
     loc = env.p1loc if player == 0 else env.p2loc
@@ -195,13 +213,13 @@ def _pool_select_action(net, state, mask):
     """Greedy action from a frozen opponent network."""
     with torch.no_grad():
         q = net(state.unsqueeze(0).to(device))[0]
-        q[~mask] = -float('inf')
+        q[~mask.to(device)] = -float('inf')
         return q.argmax().item()
 
 
-def train(episodes=50000, n=7):
-    env = Environment(n)
-    learner = Agent(n)  # only agent that trains
+def train(episodes=50000, n=7, barrier_count=10):
+    env = Environment(n,barrier_count)
+    learner = Agent(n, barrier_count)  # only agent that trains
     step = 0
 
     # Opponent pool: list of state_dicts. Initialised with a random-weight snapshot.
@@ -232,57 +250,111 @@ def train(episodes=50000, n=7):
             opp_net.eval()
 
         learner_side = ep % 2  # alternate which side the learner plays
-        env.__init__(n)
-        state = env.return_state_representation()
+        env.__init__(n, barrier_count)
         done = False
         dist = [_path_length(env, 0), _path_length(env, 1)]
         turn = 0
         cycle_penalty = 0.03 * max(0.0, 1.0 - ep / 20000)
         history = deque(maxlen=6)
 
-        while not done and turn < MAX_TURNS:
-            p = env.player_turn
-            mask = env.return_action_mask()
-
-            if p == learner_side:
-                action = learner.select_action(state, mask)
-            elif ep < 1000:  # curriculum: random opponent for first 1000 episodes
-                valid = mask.nonzero().flatten()
-                action = valid[random.randrange(len(valid))].item()
+        # If learner is player 1, opponent (player 0) must move first
+        if learner_side == 1:
+            opp_mask = env.return_action_mask()
+            if ep < 1000:
+                valid = opp_mask.nonzero().flatten()
+                opp_action = valid[random.randrange(len(valid))].item()
             else:
-                action = _pool_select_action(opp_net, state, mask)
+                opp_state = env.return_state_representation()
+                opp_action = _pool_select_action(opp_net, opp_state, opp_mask)
+            env.agent_action_function(opp_action)
+            turn += 1
+            if env.check_win() is not None:
+                done = True
+            dist = [_path_length(env, 0), _path_length(env, 1)]
+
+        state = env.return_state_representation()
+
+        while not done and turn < MAX_TURNS:
+            # ---- Learner's half-turn ----
+            assert env.player_turn == learner_side
+            learner_state = state
+            learner_mask  = env.return_action_mask()
+            action = learner.select_action(learner_state, learner_mask)
 
             env.agent_action_function(action)
             turn += 1
-
             winner = env.check_win()
             done = winner is not None
 
             if done:
-                # Reward from learner's perspective
                 reward = 1.0 if winner == learner_side else -1.0
-            else:
-                new_dist = [_path_length(env, 0), _path_length(env, 1)]
-                my_progress  = (dist[learner_side]   - new_dist[learner_side])   * 0.05
-                opp_set_back = (new_dist[1-learner_side] - dist[1-learner_side]) * 0.01
-                reward = my_progress + opp_set_back - 0.002  # per-turn penalty
-                dist = new_dist
-                if p == learner_side:
-                    new_pos = tuple(env.p1loc if learner_side == 0 else env.p2loc)
-                    if new_pos in history:
-                        reward -= cycle_penalty
-                    history.append(new_pos)
-
-            next_state = env.return_state_representation()
-
-            # Only push transitions for the learner
-            if p == learner_side:
-                learner.push_transition(state, action, reward, next_state, done)
+                next_state = env.return_state_representation()
+                next_mask  = env.return_action_mask()
+                learner.push_transition(learner_state, action, reward, next_state, next_mask, True)
                 if step % learner.train_freq == 0:
                     learner.train_step(step)
                 step += 1
+                state = next_state
+                break
 
+            new_dist = [_path_length(env, 0), _path_length(env, 1)]
+            my_progress  = (dist[learner_side]     - new_dist[learner_side])     * 0.05
+            opp_set_back = (new_dist[1-learner_side] - dist[1-learner_side])     * 0.01
+            reward = my_progress + opp_set_back - 0.002
+            dist = new_dist
+            new_pos = tuple(env.p1loc if learner_side == 0 else env.p2loc)
+            if new_pos in history:
+                reward -= cycle_penalty
+            history.append(new_pos)
+
+            # ---- Opponent's half-turn ----
+            if turn >= MAX_TURNS:
+                # Timeout mid-ply: flush with current state as bootstrap
+                next_state = env.return_state_representation()
+                next_mask  = env.return_action_mask()
+                learner.push_transition(learner_state, action, reward, next_state, next_mask, False)
+                if step % learner.train_freq == 0:
+                    learner.train_step(step)
+                step += 1
+                state = next_state
+                done = False  # let outer loop exit via turn >= MAX_TURNS check
+                break
+
+            opp_mask = env.return_action_mask()
+            if ep < 1000:
+                valid = opp_mask.nonzero().flatten()
+                opp_action = valid[random.randrange(len(valid))].item()
+            else:
+                opp_state = env.return_state_representation()
+                opp_action = _pool_select_action(opp_net, opp_state, opp_mask)
+
+            env.agent_action_function(opp_action)
+            turn += 1
+            winner = env.check_win()
+            done = winner is not None
+
+            if done:
+                reward += -1.0  # opponent won — override shaping with terminal signal
+                reward  = -1.0
+
+            new_dist = [_path_length(env, 0), _path_length(env, 1)]
+            if not done:
+                dist = new_dist
+
+            # next_state is now the start of the learner's next turn — max Q is correct
+            next_state = env.return_state_representation()
+            next_mask  = env.return_action_mask()
+
+            learner.push_transition(learner_state, action, reward, next_state, next_mask, done)
+            if step % learner.train_freq == 0:
+                learner.train_step(step)
+            step += 1
             state = next_state
+
+        # Flush leftover n-step transitions on timeout — prevents cross-episode contamination
+        if not done:
+            while learner.n_step_buf:
+                learner._commit_oldest()
 
         ep_time = time.time() - ep_start
         recent_turns.append(turn)
@@ -300,6 +372,7 @@ def train(episodes=50000, n=7):
                   f"avg_turns={avg_turns:.0f}  timeout={timeout_rate:.0%}  eps {learner.eps:.3f}  cycle_pen={cycle_penalty:.4f}  pool={len(pool)}")
 
         if ep > 0 and ep % 1000 == 0:
-            wr = _eval_vs_random(learner, n)
-            torch.save(learner.policy_net.state_dict(), 'dqn.pt')
+            wr = _eval_vs_random(learner, n, barrier_count)
+            torch.save({'state_dict': {k.replace('_orig_mod.', ''): v for k, v in learner.policy_net.state_dict().items()},
+                        'n': n, 'barrier_count': barrier_count}, 'dqn.pt')
             print(f"  [eval ep {ep}] win rate vs random: {wr:.0%}  (saved)")

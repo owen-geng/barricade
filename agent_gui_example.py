@@ -4,38 +4,48 @@ from environment import Environment
 from DQN_agent import AgentNet
 
 CELL_SIZE = 60
-N = 7
 STEP_DELAY_MS = 400  # ms between moves
 NUM_GAMES = 5
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def load_agent(path="dqn.pt"):
-    net = AgentNet(N, 12 + 2*(N-1)*(N-1)).to(device)
-    sd = torch.load(path, map_location=device)
-    sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+    ckpt = torch.load(path, map_location="cpu")
+    if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+        sd = ckpt['state_dict']
+        n = ckpt['n']
+        barrier_count = ckpt['barrier_count']
+    else:
+        # Legacy checkpoint: bare state_dict, infer n from output dim
+        sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt.items()}
+        output_dim = sd["head.2.bias"].shape[0]
+        n = int((((output_dim - 12) / 2) ** 0.5) + 1)
+        barrier_count = 10  # old default
+    net = AgentNet(n, 12 + 2*(n-1)*(n-1)).to(device)
     net.load_state_dict(sd)
     net.eval()
-    return net
+    return net, n, barrier_count
 
 def greedy_action(net, env):
     state = env.return_state_representation().unsqueeze(0).to(device)
     mask = env.return_action_mask()
     with torch.no_grad():
         q = net(state)[0]
-        q[~mask] = -float("inf")
+        q[~mask.to(device)] = -float("inf")
     return q.argmax().item()
 
 
 class ReplayGUI:
-    def __init__(self, root, net):
+    def __init__(self, root, net, n, barrier_count):
         self.root = root
         self.net = net
+        self.n = n
+        self.barrier_count = barrier_count
         self.game_num = 0
-        self.env = Environment(N)
+        self.env = Environment(n, barrier_count)
         self.cell_size = CELL_SIZE
 
-        self.canvas = tk.Canvas(root, width=N*CELL_SIZE, height=N*CELL_SIZE, bg="white")
+        self.canvas = tk.Canvas(root, width=n*CELL_SIZE, height=n*CELL_SIZE, bg="white")
         self.canvas.pack()
 
         frame = tk.Frame(root)
@@ -49,7 +59,7 @@ class ReplayGUI:
 
     def start_game(self):
         self.game_num += 1
-        self.env.__init__(N)
+        self.env.__init__(self.n, self.barrier_count)
         self.turn = 0
         self.status.config(text=f"Game {self.game_num}/{NUM_GAMES}")
         self.draw_board()
@@ -76,7 +86,7 @@ class ReplayGUI:
 
     def draw_board(self):
         self.canvas.delete("all")
-        n = N
+        n = self.n
         env = self.env
         cs = self.cell_size
 
@@ -112,8 +122,8 @@ class ReplayGUI:
             self.canvas.create_oval(x0, y0, x0+cs-20, y0+cs-20, fill=color, outline="white", width=2)
 
 
-net = load_agent("dqn.pt")
+net, n, barrier_count = load_agent("dqn.pt")
 root = tk.Tk()
-root.title("DQN Agent — Self-Play")
-app = ReplayGUI(root, net)
+root.title(f"DQN Agent — Self-Play ({n}x{n})")
+app = ReplayGUI(root, net, n, barrier_count)
 root.mainloop()

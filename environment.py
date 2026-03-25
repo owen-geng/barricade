@@ -494,9 +494,7 @@ class Environment:
         return 1
     
     def return_state_representation(self): #Returns state representation.
-        # Canonical representation: always from current player's perspective.
         # Layers: hbarricades, vbarricades, my_count, opp_count, my_location, opp_location, turn
-        # For player 1 the board is flipped vertically so both players always "move downward".
         p = self.player_turn
         hbarricades = torch.from_numpy((self.horizontal_barricades != 0).astype(np.float32))
         vbarricades = torch.from_numpy((self.vertical_barricades != 0).astype(np.float32))
@@ -511,10 +509,6 @@ class Environment:
         turn = torch.full((self.n, self.n), p, dtype=torch.float32)
 
         tensor_stack = torch.stack((hbarricades, vbarricades, my_count, opp_count, my_loc, opp_loc, turn))
-
-        # Flip vertically for player 1 so current player always moves toward row n-1
-        if p == 1:
-            tensor_stack = torch.flip(tensor_stack, dims=[1])
 
         return tensor_stack
     

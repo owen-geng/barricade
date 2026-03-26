@@ -181,8 +181,6 @@ class Environment:
             startpos = int(np.floor(n/2))
 
         self.n = n
-        
-        self.board = np.zeros([n, n])
 
         self.p1loc = [0, startpos]
         self.p2loc = [n-1, startpos]
@@ -194,7 +192,20 @@ class Environment:
         self.player_turn = 0
         self.barricade_id = 1
         self._visited = np.zeros((n, n), dtype=bool)  # reused by possible_path
+        self.position_history = {}
+        self._record_position()
     
+
+    def _position_key(self):
+        return (
+            tuple(self.p1loc), tuple(self.p2loc), self.player_turn,
+            (self.horizontal_barricades != 0).tobytes(),
+            (self.vertical_barricades != 0).tobytes(),
+        )
+
+    def _record_position(self):
+        key = self._position_key()
+        self.position_history[key] = self.position_history.get(key, 0) + 1
 
     def blocked_paths(self, loc): #Loc is a 2x2 arr
         valid = [False, False, False, False] #Up, Right, Down, Left
@@ -413,6 +424,7 @@ class Environment:
         self.player_turn = 0 if self.player_turn == 1 else 1
 
         self.turn_count += 1 #Increment turn count
+        self._record_position()
         return 0
         
 
@@ -431,8 +443,9 @@ class Environment:
         self.barricade_counts[self.player_turn] -= 1
 
         self.player_turn = 0 if self.player_turn == 1 else 1
+        self._record_position()
         return 0
-    
+
     def place_vertical_barrier(self, loc):
         if loc[0] > self.n-1 or loc[1] > self.n-1:
             print("Unsafe vbarrier!")
@@ -443,6 +456,7 @@ class Environment:
         self.barricade_counts[self.player_turn] -= 1
 
         self.player_turn = 0 if self.player_turn == 1 else 1
+        self._record_position()
         return 0
 
     def check_win(self):
@@ -450,6 +464,26 @@ class Environment:
             return 0
         if self.p2loc[0] == 0:
             return 1
+        if self.position_history.get(self._position_key(), 0) >= 3:
+            return 2  # draw by threefold repetition
+        # Heuristic: when no barricades remain the outcome is a pure race.
+        # A jump saves at most 1 step, so:
+        #   current player wins if d_cur <= d_opp - 1  (jump can only tie, but cur moves first)
+        #   opponent wins if d_opp <= d_cur - 2        (cur's jump can only tie, opp still wins)
+        if self.barricade_counts[0] == 0 and self.barricade_counts[1] == 0:
+            cur = self.player_turn
+            loc_cur = self.p1loc if cur == 0 else self.p2loc
+            loc_opp = self.p2loc if cur == 0 else self.p1loc
+            goal_cur = self.n - 1 if cur == 0 else 0
+            goal_opp = 0 if cur == 0 else self.n - 1
+            d_cur = int(_jit_path_length(self.horizontal_barricades, self.vertical_barricades,
+                                         self.n, loc_cur[0], loc_cur[1], goal_cur))
+            d_opp = int(_jit_path_length(self.horizontal_barricades, self.vertical_barricades,
+                                         self.n, loc_opp[0], loc_opp[1], goal_opp))
+            if d_cur <= d_opp - 1:
+                return cur
+            if d_opp <= d_cur - 2:
+                return 1 - cur
         return None
     
 
@@ -493,7 +527,7 @@ class Environment:
             return None
         return 1
     
-    def return_state_representation(self): #Returns state representation.
+    def return_state_representation(self, mode="dqn"): #Returns state representation.
         # Layers: hbarricades, vbarricades, my_count, opp_count, my_location, opp_location, turn
         p = self.player_turn
         hbarricades = torch.from_numpy((self.horizontal_barricades != 0).astype(np.float32))
@@ -508,8 +542,10 @@ class Environment:
         opp_loc[opp_pos[0]][opp_pos[1]] = 1
         turn = torch.full((self.n, self.n), p, dtype=torch.float32)
 
-        tensor_stack = torch.stack((hbarricades, vbarricades, my_count, opp_count, my_loc, opp_loc, turn))
-
+        if mode == "dqn":
+            tensor_stack = torch.stack((hbarricades, vbarricades, my_count, opp_count, my_loc, opp_loc, turn))
+        else:
+            tensor_stack = torch.stack((hbarricades, vbarricades, my_count, opp_count, my_loc, opp_loc)) #For MCTS, we'll encode turn information by flipping the board.
         return tensor_stack
     
     def return_action_mask(self): #Returns mask for valid actions.
@@ -526,3 +562,68 @@ class Environment:
             return -1
         return 0
     
+
+    def return_canonical_state_representation(self):
+        # 6-layer state (no turn plane — board orientation encodes whose turn it is).
+        # For player 1, rotate 180° so both players see themselves moving downward.
+        tensor_stack = self.return_state_representation(mode="mcts")  # (6, n, n)
+
+        if self.player_turn == 0:
+            return tensor_stack
+
+        rotated = torch.rot90(tensor_stack, 2, dims=[1, 2])
+
+        # rot90 shifts h_bar semantics by 1 row: h_bar[r] blocks below row r, but after
+        # rotation it lands at row n-1-r instead of the correct n-2-r. Shift up by 1.
+        h = torch.zeros_like(rotated[0])
+        h[:-1, :] = rotated[0, 1:, :]
+
+        # rot90 shifts v_bar semantics by 1 col: v_bar[c] blocks right of col c, but after
+        # rotation it lands at col n-1-c instead of the correct n-2-c. Shift left by 1.
+        v = torch.zeros_like(rotated[1])
+        v[:, :-1] = rotated[1, :, 1:]
+
+        result = rotated.clone()
+        result[0] = h
+        result[1] = v
+        return result
+    
+    def convert_canonical_action(self, action):
+        if self.player_turn == 0:
+            return action
+
+        n = self.n
+        hbarvbarsize = (n - 1) * (n - 1)
+
+        if action < N_MOVE_ACTIONS:
+            # 180° rotation negates both offsets. By construction of MOVE_OFFSETS,
+            # offset i and offset (11 - i) are exact negations, so the mapping is trivial.
+            return N_MOVE_ACTIONS - 1 - action
+
+        elif action < N_MOVE_ACTIONS + hbarvbarsize:
+            # Canonical h_bar at (er, ec) was placed at real (n-2-er, n-2-ec).
+            er, ec = divmod(action - N_MOVE_ACTIONS, n - 1)
+            return N_MOVE_ACTIONS + (n - 2 - er) * (n - 1) + (n - 2 - ec)
+
+        else:
+            # Canonical v_bar at (er, ec) was placed at real (n-2-er, n-2-ec).
+            er, ec = divmod(action - N_MOVE_ACTIONS - hbarvbarsize, n - 1)
+            return N_MOVE_ACTIONS + hbarvbarsize + (n - 2 - er) * (n - 1) + (n - 2 - ec)
+        
+    
+    def clone(self):
+        cloned = Environment.__new__(Environment)
+        cloned.n = self.n
+        cloned.p1loc = self.p1loc[:]
+        cloned.p2loc = self.p2loc[:]
+        cloned.barricade_counts = self.barricade_counts[:]
+        cloned.horizontal_barricades = self.horizontal_barricades.copy()
+        cloned.vertical_barricades = self.vertical_barricades.copy()
+        cloned.player_turn = self.player_turn
+        cloned.barricade_id = self.barricade_id
+        cloned.turn_count = self.turn_count
+        cloned.position_history = dict(self.position_history)
+        return cloned
+        
+
+
